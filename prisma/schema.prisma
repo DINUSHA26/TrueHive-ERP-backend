@@ -1,0 +1,1029 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==========================================
+// 1. AUTHENTICATION & RBAC
+// ==========================================
+
+enum RoleType {
+  SUPER_ADMIN
+  MANAGER
+  CASHIER_POS
+  SUPPORT_AGENT
+  INVENTORY_STAFF
+  ACCOUNTANT
+}
+
+model User {
+  id           String        @id @default(cuid())
+  name         String
+  email        String        @unique
+  phone        String?
+  passwordHash String
+  role         RoleType      @default(SUPPORT_AGENT)
+  permissions  Json?         // Granular module permissions array
+  fcmToken     String?       // Firebase Cloud Messaging token for push notifications
+  isActive     Boolean       @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  sessions     UserSession[]
+  assignedLeads Lead[]       @relation("AssignedAgentLeads")
+  assignedChats ChatRoom[]   @relation("AssignedAgentChats")
+}
+
+model UserSession {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// 2. CUSTOMERS & LEADS CRM (GenLead SL Style)
+// ==========================================
+
+enum LeadStage {
+  NEW
+  CONTACTED
+  SCHEDULED
+  COMPLETED
+  LOST
+}
+
+enum LeadIntent {
+  HIGH_INTENT
+  ENGAGED
+  EXPLORING
+  URGENT_ESCALATION
+}
+
+model Customer {
+  id             String                  @id @default(cuid())
+  customerCode   String?                 @unique // e.g. CUST-0001, CUST-0002
+  name           String
+  phone          String                  @unique
+  whatsappId     String?                 @unique
+  nic            String?
+  email          String?
+  address        String?
+  city           String?
+  customerType   String                  @default("Regular") // Regular, Wholesale, Corporate
+  creditLimit    Float                   @default(0) // Max allowed credit in Rs.
+  creditDays     Int                     @default(30) // Credit day terms
+  starPoints     Float                   @default(0) // Loyalty points
+  creditBalance  Float                   @default(0) // Outstanding unpaid credit
+  customFields   String?                 // JSON custom attributes (e.g. Serial, Brand)
+  isActive       Boolean                 @default(true)
+  totalOrders    Int                     @default(0)
+  totalSpent     Float                   @default(0)
+  segment        String                  @default("REGULAR") // VIP, REPEAT, REGULAR, NEW
+  zohoSyncedAt   DateTime?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  leads          Lead[]
+  chatRooms      ChatRoom[]
+  orders         Order[]
+  creditBills    CustomerCreditBill[]
+  creditPayments CustomerCreditPayment[]
+  quotations     Quotation[]
+  invoices       Invoice[]
+}
+
+model Lead {
+  id                 String         @id @default(cuid())
+  customerId         String?
+  customerName       String
+  phone              String
+  town               String?
+  stage              LeadStage      @default(NEW)
+  intent             LeadIntent     @default(EXPLORING)
+  issueSummary       String         // AI-extracted summary of requirement
+  businessType       String?        // AI-extracted dynamic field
+  dailyMessageVolume String?        // AI-extracted dynamic field
+  needsMediaSupport  Boolean        @default(false)
+  customFields       Json?          // Additional AI-extracted key-value pairs
+  nextFollowUpAt     DateTime?
+  assignedAgentId    String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  customer           Customer?      @relation(fields: [customerId], references: [id])
+  assignedAgent      User?          @relation("AssignedAgentLeads", fields: [assignedAgentId], references: [id])
+  callNotes          LeadCallNote[]
+
+  @@index([stage])
+  @@index([intent])
+  @@index([nextFollowUpAt])
+}
+
+model LeadCallNote {
+  id         String   @id @default(cuid())
+  leadId     String
+  authorName String
+  note       String
+  createdAt  DateTime @default(now())
+
+  lead       Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// 3. WHATSAPP LIVE CHAT & HUMAN HANDOVER
+// ==========================================
+
+enum HandoverStatus {
+  AI_ACTIVE
+  HUMAN_HANDOVER
+  URGENT_ESCALATION
+  RESOLVED
+}
+
+model ChatRoom {
+  id              String         @id @default(cuid())
+  customerId      String?
+  whatsappPhone   String         @unique
+  customerName    String
+  isAiActive      Boolean        @default(true)
+  handoverStatus  HandoverStatus @default(AI_ACTIVE)
+  escalationReason String?
+  assignedAgentId String?
+  unreadCount     Int            @default(0)
+  lastMessageText String?
+  lastMessageAt   DateTime       @default(now())
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  customer        Customer?      @relation(fields: [customerId], references: [id])
+  assignedAgent   User?          @relation("AssignedAgentChats", fields: [assignedAgentId], references: [id])
+  messages        ChatMessage[]
+}
+
+model ChatMessage {
+  id          String   @id @default(cuid())
+  chatRoomId  String
+  waMessageId String?  @unique
+  direction   String   // INBOUND, OUTBOUND
+  senderType  String   // CUSTOMER, AI_BOT, HUMAN_AGENT, SYSTEM
+  messageType String   @default("TEXT") // TEXT, AUDIO, IMAGE, DOCUMENT, TEMPLATE
+  content     String
+  mediaUrl    String?  // Cloudinary URL for voice notes, images, payment slips
+  aiToolCalls Json?    // Trace of tools executed by Gemini Agentic Loop
+  createdAt   DateTime @default(now())
+
+  chatRoom    ChatRoom @relation(fields: [chatRoomId], references: [id], onDelete: Cascade)
+
+  @@index([chatRoomId, createdAt])
+}
+
+// ==========================================
+// 4. PRODUCTS, BARCODES & BOM INGREDIENTS
+// ==========================================
+
+model Category {
+  id          String     @id @default(cuid())
+  name        String     @unique
+  slug        String     @unique
+  description String?
+  image       String?
+  parentId    String?
+  parent      Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children    Category[] @relation("CategoryHierarchy")
+  isActive    Boolean    @default(true)
+  sortOrder   Int        @default(0)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now()) @updatedAt
+
+  products    Product[]
+
+  @@index([slug])
+  @@index([parentId])
+}
+
+model Product {
+  id             String                 @id @default(cuid())
+  name           String
+  slug           String                 @unique
+  sku            String                 @unique
+  barcode        String                 @unique // CODE128 / EAN13 barcode
+  categoryId     String?
+  description    String?
+  imageUrl       String?
+  images         Json?                  // Array of image objects [{ url, altText, position }]
+  sellingPrice   Float
+  discountPrice  Float?                 // Compare at price
+  calculatedCogs Float                  @default(0) // Auto-calculated from BOM ingredients or manual purchase cost
+  currentStock   Float                  @default(0)
+  reservedStock  Float                  @default(0)
+  reorderLevel   Float                  @default(5)
+  unit           String                 @default("pcs")
+  trackBom       Boolean                @default(false) // Deduct BOM ingredients on PROCESSING
+  knowledgeBase  Json?                  // Structured AI Knowledge: benefits, usage, servings, bestTimeToUse, ingredients, reviews, etc.
+  isActive       Boolean                @default(true)
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  category       Category?              @relation(fields: [categoryId], references: [id])
+  variants       ProductVariant[]
+  bomItems       ProductIngredientBOM[]
+  orderItems     OrderItem[]
+  stockMovements StockMovement[]
+  quotationItems QuotationItem[]
+  invoiceItems   InvoiceItem[]
+}
+
+model ProductVariant {
+  id              String      @id @default(cuid())
+  productId       String
+  name            String      // e.g. "Size / Color", "1kg", "XL"
+  value           String?     // e.g. "XL / Blue", "1kg"
+  sku             String      @unique
+  barcode         String      @unique
+  sellingPrice    Float
+  priceAdjustment Float?      @default(0)
+  currentStock    Float       @default(0)
+  image           String?
+  createdAt       DateTime    @default(now())
+
+  product         Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems      OrderItem[]
+}
+
+model Ingredient {
+  id             String                 @id @default(cuid())
+  name           String
+  sku            String                 @unique
+  barcode        String?                @unique
+  unit           String                 @default("kg") // kg, g, L, ml, pcs, m
+  currentStock   Float                  @default(0)
+  reorderLevel   Float                  @default(5)
+  unitCost       Float                  @default(0)    // Cost per unit in LKR
+  supplierId     String?
+  isActive       Boolean                @default(true)
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  supplier       Supplier?              @relation(fields: [supplierId], references: [id])
+  bomUsages      ProductIngredientBOM[]
+  stockMovements StockMovement[]
+  poItems        PurchaseOrderItem[]
+}
+
+model ProductIngredientBOM {
+  id               String     @id @default(cuid())
+  productId        String
+  ingredientId     String
+  quantityRequired Float      // Quantity of ingredient needed per 1 unit of Product
+  wastagePercent   Float      @default(0)
+  notes            String?
+
+  product          Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  ingredient       Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, ingredientId])
+}
+
+enum StockMovementType {
+  PURCHASE_GRN
+  POS_SALE
+  ORDER_PROCESSING_BOM
+  MANUAL_ADJUSTMENT
+  WASTAGE
+  RETURN
+}
+
+model StockMovement {
+  id             String            @id @default(cuid())
+  productId      String?
+  ingredientId   String?
+  type           StockMovementType
+  quantityChange Float             // Negative for deduction, Positive for addition
+  balanceAfter   Float
+  unitCost       Float             @default(0)
+  referenceId    String?           // Order Number or GRN Number
+  notes          String?
+  createdBy      String?
+  createdAt      DateTime          @default(now())
+
+  product        Product?          @relation(fields: [productId], references: [id])
+  ingredient     Ingredient?       @relation(fields: [ingredientId], references: [id])
+}
+
+// ==========================================
+// 5. SUPPLIERS, PURCHASE ORDERS (PO) & GRN
+// ==========================================
+
+model Supplier {
+  id               String                @id @default(cuid())
+  supplierCode     String?               @unique // e.g. SUP-0001
+  name             String
+  contactPerson    String?
+  phone            String
+  email            String?
+  address          String?
+  creditLimit      Float                 @default(0) // Maximum agreed credit exposure
+  creditDays       Int                   @default(30) // Default due date days
+  description      String?
+  creditBalance    Float                 @default(0) // Amount currently owed to supplier
+  isActive         Boolean               @default(true)
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  ingredients      Ingredient[]
+  purchaseOrders   PurchaseOrder[]
+  supplierBills    SupplierBill[]
+  supplierPayments SupplierBillPayment[]
+}
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  poNumber     String              @unique
+  supplierId   String
+  status       String              @default("DRAFT") // DRAFT, SENT, PARTIAL_GRN, COMPLETED, CANCELLED
+  totalAmount  Float               @default(0)
+  paidAmount   Float               @default(0)
+  notes        String?
+  expectedDate DateTime?
+  receivedAt   DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  supplier     Supplier            @relation(fields: [supplierId], references: [id])
+  items        PurchaseOrderItem[]
+}
+
+model PurchaseOrderItem {
+  id               String        @id @default(cuid())
+  purchaseOrderId  String
+  ingredientId     String?
+  itemName         String
+  quantityOrdered  Float
+  quantityReceived Float         @default(0)
+  unitCost         Float
+  totalCost        Float
+
+  purchaseOrder    PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  ingredient       Ingredient?   @relation(fields: [ingredientId], references: [id])
+}
+
+// ==========================================
+// 6. ORDERS, POS & INVOICING
+// ==========================================
+
+enum OrderSource {
+  WHATSAPP_AI
+  POS_TERMINAL
+  MANUAL_DASHBOARD
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  READY_TO_SHIP
+  SHIPPED
+  DELIVERED
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  BANK_TRANSFER
+  COD
+  SPLIT
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  VERIFYING_SLIP
+  REFUNDED
+}
+
+model Order {
+  id               String               @id @default(cuid())
+  orderNumber      String               @unique // e.g. #ORD-2501 or #POS-1001
+  barcode          String               @unique
+  customerId       String?
+  customerName     String
+  customerPhone    String
+  shippingAddress  String?
+  source           OrderSource          @default(WHATSAPP_AI)
+  status           OrderStatus          @default(PENDING)
+  paymentMethod    PaymentMethod        @default(COD)
+  paymentStatus    PaymentStatus        @default(UNPAID)
+  subtotal         Float
+  discountAmount   Float                @default(0)
+  taxAmount        Float                @default(0)
+  deliveryFee      Float                @default(0)
+  totalAmount      Float
+  totalCogs        Float                @default(0) // Total cost of goods & BOM ingredients
+  cashReceived     Float?
+  changeGiven      Float?
+  bomDeducted      Boolean              @default(false) // Set true when status hits PROCESSING or POS sale
+  bomDeductedAt    DateTime?
+  slipImageUrl     String?              // Cloudinary URL for bank transfer receipt
+  slipVerifiedByAi Boolean              @default(false)
+  notes            String?
+  secondaryPhone       String?
+  deliveryCity         String?
+  courierPartner       String?              // e.g. Prompt, Koombiyo, Standard Courier, Domex, Pronto
+  trackingNumber       String?              // e.g. TRK-12345
+  expectedDeliveryDate DateTime?
+  codAmount            Float?
+  courierFee           Float?               @default(0)
+  settlementStatus     String?              @default("NOT_DUE") // NOT_DUE, AWAITING_COLLECTION, AWAITING_REMITTANCE, SETTLED, DISPUTED
+  remittedAmount       Float?               @default(0)
+  remittanceRef        String?
+  remittedAt           DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  customer         Customer?            @relation(fields: [customerId], references: [id])
+  items            OrderItem[]
+  statusHistory    OrderStatusHistory[]
+  quotations       Quotation[]
+  invoice          Invoice?
+
+  @@index([status])
+  @@index([source])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id          String          @id @default(cuid())
+  orderId     String
+  productId   String
+  variantId   String?
+  productName String
+  sku         String
+  barcode     String
+  quantity    Float
+  unitPrice   Float
+  unitCogs    Float           @default(0)
+  discount    Float           @default(0)
+  totalPrice  Float
+
+  order       Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id])
+  variant     ProductVariant? @relation(fields: [variantId], references: [id])
+}
+
+model OrderStatusHistory {
+  id           String      @id @default(cuid())
+  orderId      String
+  status       OrderStatus
+  note         String?
+  whatsappSent Boolean     @default(false)
+  updatedBy    String?
+  createdAt    DateTime    @default(now())
+
+  order        Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// 7. CASH FLOW & FINANCIAL MANAGEMENT
+// ==========================================
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  SUPPLIER_PAYMENT
+  COGS_RECOGNITION
+  SALARY
+  MARKETING
+}
+
+model FinancialAccount {
+  id            String                @id @default(cuid())
+  name          String                // e.g. "Main Cash Drawer", "Commercial Bank", "COD Pending Wallet"
+  type          String                // CASH_DRAWER, BANK_ACCOUNT, COD_WALLET
+  balance       Float                 @default(0)
+  accountNumber String?
+  bankName      String?
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+
+  transactions  CashFlowTransaction[]
+}
+
+model CashFlowTransaction {
+  id               String            @id @default(cuid())
+  transactionCode  String            @unique
+  accountId        String?
+  type             TransactionType
+  category         String            // POS_SALE, WHATSAPP_ORDER, RAW_MATERIAL_PO, UTILITY, RENT, SALARY, AD_SPEND
+  amount           Float
+  description      String
+  referenceOrderId String?
+  referencePoId    String?
+  paymentMethod    String            @default("CASH")
+  receiptUrl       String?
+  recordedBy       String?
+  transactionDate  DateTime          @default(now())
+  createdAt        DateTime          @default(now())
+
+  account          FinancialAccount? @relation(fields: [accountId], references: [id])
+
+  @@index([type, transactionDate])
+}
+
+// ==========================================
+// 8. LIVE GOOGLE DOCS / SHEETS & MARKETING
+// ==========================================
+
+model GoogleReportSync {
+  id            String   @id @default(cuid())
+  reportTitle   String
+  reportType    String   // DAILY_SUMMARY, MONTHLY_PNL, INVENTORY_BOM_AUDIT
+  googleDocId   String?
+  googleSheetId String?
+  docUrl        String?
+  sheetUrl      String?
+  aiNarrative   String?
+  syncStatus    String   @default("SUCCESS")
+  lastSyncedAt  DateTime @default(now())
+}
+
+model MarketingCampaign {
+  id              String   @id @default(cuid())
+  name            String
+  channel         String   // WHATSAPP_BROADCAST, ZOHO_CAMPAIGN, RESEND_EMAIL
+  targetSegment   String   // ALL, HIGH_INTENT, VIP, OVERDUE_LEADS
+  messageTemplate String
+  totalRecipients Int      @default(0)
+  sentCount       Int      @default(0)
+  status          String   @default("COMPLETED")
+  createdAt       DateTime @default(now())
+}
+
+// ==========================================
+// 9. CREDIT MANAGEMENT (AR & AP)
+// ==========================================
+
+model CustomerCreditBill {
+  id           String                  @id @default(cuid())
+  billNumber   String                  @unique // e.g. CB-1001, INV-886000
+  customerId   String
+  customerName String
+  orderId      String?
+  creditType   String                  @default("Credit") // Cash, Credit, Cheque
+  bankCheque   String?
+  chequeDate   DateTime?
+  totalAmount  Float
+  paidAmount   Float                   @default(0)
+  balance      Float
+  dateGiven    DateTime                @default(now())
+  dueDate      DateTime?
+  status       String                  @default("PENDING") // PENDING, PARTIAL, PAID, OVERDUE
+  notes        String?
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+
+  customer     Customer                @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  payments     CustomerCreditPayment[]
+}
+
+model CustomerCreditPayment {
+  id            String             @id @default(cuid())
+  billId        String
+  customerId    String
+  amount        Float
+  paymentDate   DateTime           @default(now())
+  paymentMethod String             @default("CASH") // CASH, CARD, BANK_TRANSFER, CHEQUE
+  reference     String?
+  notes         String?
+  createdAt     DateTime           @default(now())
+
+  bill          CustomerCreditBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  customer      Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+}
+
+model SupplierBill {
+  id            String                @id @default(cuid())
+  billNumber    String                @unique // e.g. SB-1001, 11111
+  supplierId    String
+  supplierName  String
+  poGrnNumber   String?               // e.g. 22222
+  invoiceNumber String?
+  receivedDate  DateTime              @default(now())
+  invoiceDate   DateTime              @default(now())
+  creditDays    Int                   @default(30)
+  dueDate       DateTime
+  totalAmount   Float
+  paidAmount    Float                 @default(0)
+  balance       Float
+  status        String                @default("DUE") // DUE, PARTIAL, PAID, OVERDUE
+  itemType      String                @default("PRODUCT") // PRODUCT, INGREDIENT, GENERAL
+  items         String?               // JSON string of purchased items
+  notes         String?
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+
+  supplier      Supplier              @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  payments      SupplierBillPayment[]
+}
+
+model SupplierBillPayment {
+  id            String       @id @default(cuid())
+  billId        String
+  supplierId    String
+  amount        Float
+  paymentDate   DateTime     @default(now())
+  paymentMethod String       @default("BANK_TRANSFER") // CASH, BANK_TRANSFER, CHEQUE
+  reference     String?
+  notes         String?
+  createdAt     DateTime     @default(now())
+
+  bill          SupplierBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+  supplier      Supplier     @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// 10. PETTY CASH & CASH FLOW MANAGEMENT
+// ==========================================
+
+model PettyCashFund {
+  id             String             @id @default(cuid())
+  name           String             // e.g. "Main Office Petty Cash", "Retail Counter Fund"
+  branch         String             @default("Head Office")
+  custodian      String             // Custodian in charge, e.g. "Dinusha (Finance)"
+  currency       String             @default("LKR")
+  floatLimit     Float              @default(10000) // Authorized imprest float limit
+  voucherLimit   Float              @default(3000)  // Single voucher threshold limit
+  currentBalance Float              @default(10000) // Current available cash balance
+  isActive       Boolean            @default(true)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  vouchers       PettyCashVoucher[]
+  cashCounts     PettyCashCount[]
+}
+
+model PettyCashVoucher {
+  id              String         @id @default(cuid())
+  voucherCode     String         @unique // e.g. "PC-001", "PC-002"
+  fundId          String
+  category        String         // Stationery, Refreshments, Transport, Printing, Cleaning, Maintenance, Other
+  amount          Float
+  payee           String         // Person or vendor paid
+  purpose         String         // Business reason / description
+  receiptUrl      String?        // Attached bill / receipt slip
+  status          String         @default("SUBMITTED") // DRAFT, SUBMITTED, APPROVED, PAID, REJECTED
+  requestedBy     String?
+  approvedBy      String?
+  rejectionReason String?
+  paidAt          DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  fund            PettyCashFund  @relation(fields: [fundId], references: [id], onDelete: Cascade)
+
+  @@index([fundId, status])
+}
+
+model PettyCashCount {
+  id              String        @id @default(cuid())
+  fundId          String
+  expectedBalance Float
+  countedBalance  Float
+  variance        Float         @default(0) // counted - expected (shortage is negative)
+  denominations   Json?         // { note5000: 1, note1000: 1, note500: 1, ... }
+  notes           String?
+  countedBy       String
+  reviewedBy      String?
+  status          String        @default("VERIFIED") // VERIFIED, VARIANCE_INVESTIGATING
+  createdAt       DateTime      @default(now())
+
+  fund            PettyCashFund @relation(fields: [fundId], references: [id], onDelete: Cascade)
+
+  @@index([fundId, createdAt])
+}
+
+model FundTransfer {
+  id           String   @id @default(cuid())
+  transferCode String   @unique // e.g. "TRF-1001"
+  fromAccount  String   // e.g. "Commercial Bank Account", "POS Till"
+  toAccount    String   // e.g. "Main Office Petty Cash"
+  amount       Float
+  reference    String?  // Cheque # or Bank Ref
+  description  String?
+  status       String   @default("COMPLETED")
+  recordedBy   String?
+  transferDate DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@index([transferDate])
+}
+
+// ==========================================
+// 10. QUOTATIONS & PRO-FORMA INVOICES
+// ==========================================
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  INVOICED
+  DECLINED
+  EXPIRED
+}
+
+model Quotation {
+  id                  String          @id @default(cuid())
+  quoteNumber         String          @unique // e.g. "QT-1001", "QT-1002"
+  date                DateTime        @default(now())
+  validUntil          DateTime?
+  status              QuotationStatus @default(DRAFT)
+
+  // Client Details
+  customerId          String?
+  clientName          String
+  clientPhone         String?
+  clientEmail         String?
+  clientAddress       String?
+
+  // Extra Reference / Meta
+  projectTitle        String?
+  projectDesc         String?
+  vehicleNo           String?         // Vehicle No or custom reference (e.g. CAY 6271)
+  preparedBy          String?         @default("Fashion dora")
+  notes               String?
+
+  // Financial Breakdown
+  subtotal            Float           @default(0)
+  discountPercent     Float           @default(0)
+  discountAmount      Float           @default(0)
+  taxPercent          Float           @default(0)
+  taxAmount           Float           @default(0)
+  finalAmount         Float           @default(0)
+  amountPaid          Float           @default(0)
+  balance             Float           @default(0)
+  amountInWords       String?
+
+  // Converted Invoice Information
+  convertedToInvoice Boolean         @default(false)
+  invoiceNumber       String?         // e.g. "INV-858000"
+  invoicedAt          DateTime?
+  paymentMethod       String?         @default("Cash") // Cash, Card, Bank Transfer, Credit
+  orderId             String?
+
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  customer            Customer?       @relation(fields: [customerId], references: [id])
+  order               Order?          @relation(fields: [orderId], references: [id])
+  items               QuotationItem[]
+
+  @@index([quoteNumber])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model QuotationItem {
+  id          String    @id @default(cuid())
+  quotationId String
+  productId   String?
+  itemIndex   Int       @default(1)
+  description String    // Item or service name
+  unit        String    @default("Pcs") // Pcs, Set, kg, g, mg, ml, ltr, m, Box, Bottle, Pack, Custom
+  quantity    Float     @default(1)
+  unitPrice   Float     @default(0)
+  discount    Float     @default(0)
+  taxPercent  Float     @default(0) // GST/Tax %
+  amount      Float     @default(0)
+
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  product     Product?  @relation(fields: [productId], references: [id])
+
+  @@index([quotationId])
+}
+
+// ==========================================
+// 11. CENTRAL INVOICE ENGINE (ERP Report 19 Nov 2026)
+// ==========================================
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  PARTIAL
+  UNPAID
+  VOID
+}
+
+enum InvoiceType {
+  STANDARD
+  POS_RECEIPT
+  TAX_INVOICE
+  PROFORMA
+  CREDIT_NOTE
+}
+
+model Invoice {
+  id              String        @id @default(cuid())
+  invoiceNumber   String        @unique // e.g. "INV-858000"
+  type            InvoiceType   @default(STANDARD)
+  status          InvoiceStatus @default(ISSUED)
+  issuedAt        DateTime      @default(now())
+  dueDate         DateTime?
+
+  // Sources & Relations
+  orderId         String?       @unique
+  order           Order?        @relation(fields: [orderId], references: [id])
+  customerId      String?
+  customer        Customer?     @relation(fields: [customerId], references: [id])
+  quotationId     String?
+
+  // Immutable Snapshots
+  customerName    String
+  customerPhone   String?
+  customerEmail   String?
+  billingAddress  String?
+
+  // Financial Breakdown
+  currency        String        @default("LKR")
+  subtotal        Float         @default(0)
+  discountAmount  Float         @default(0) // Total offers/discounts
+  taxAmount       Float         @default(0)
+  deliveryFee     Float         @default(0)
+  totalAmount     Float         @default(0)
+  paidAmount      Float         @default(0)
+  creditBilled    Float         @default(0) // Amount charged to Customer AR Credit
+  balance         Float         @default(0)
+  returnValue     Float         @default(0) // Return value / credit notes
+
+  // Payment Arrangement
+  paymentMethod   String        @default("CASH") // CASH, CARD, BANK_TRANSFER, CREDIT, COD
+  paymentStatus   String        @default("PAID")
+
+  notes           String?
+  voidReason      String?
+  voidedAt        DateTime?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  items           InvoiceItem[]
+
+  @@index([invoiceNumber])
+  @@index([status])
+  @@index([issuedAt])
+}
+
+model InvoiceItem {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  productId   String?
+  sku         String?
+  description String
+  unit        String   @default("pcs")
+  quantity    Float    @default(1)
+  unitPrice   Float    @default(0)
+  discount    Float    @default(0)
+  taxRate     Float    @default(0)
+  totalPrice  Float    @default(0)
+
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product     Product? @relation(fields: [productId], references: [id])
+
+  @@index([invoiceId])
+}
+
+// ==========================================
+// HUMAN RESOURCES & PAYROLL (HRM)
+// ==========================================
+
+enum SalaryType {
+  MONTHLY
+  DAILY
+  HOURLY
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
+  PROBATION
+}
+
+enum AttendanceStatus {
+  PRESENT
+  HALF_DAY
+  ABSENT
+  LEAVE
+}
+
+enum PayrollStatus {
+  OPEN
+  APPROVED
+  PAID
+}
+
+model Employee {
+  id              String            @id @default(cuid())
+  empId           String            @unique // e.g. "001", "002", "W04"
+  name            String
+  phone           String?
+  email           String?
+  department      String?           @default("Operations")
+  designation     String?           @default("Staff")
+  salaryType      SalaryType        @default(MONTHLY)
+  basicSalary     Float             @default(0) // Basic / Daily rate (LKR)
+  mealCost        Float             @default(0) // Default meal cost (LKR)
+  epfEtf          Float             @default(0) // Default EPF/ETF (LKR)
+  status          EmployeeStatus    @default(ACTIVE)
+  joinedDate      DateTime          @default(now())
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  attendances     AttendanceRecord[]
+  advances        SalaryAdvance[]
+  payrollItems    PayrollRecord[]
+
+  @@index([empId])
+  @@index([status])
+}
+
+model AttendanceRecord {
+  id              String            @id @default(cuid())
+  employeeId      String
+  date            String            // YYYY-MM-DD
+  status          AttendanceStatus  @default(PRESENT)
+  payableUnits    Float             @default(1.0) // 1.0 for Present, 0.5 for Half Day, 0.0 for Absent
+  notes           String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  employee        Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, date])
+  @@index([date])
+  @@index([employeeId])
+}
+
+model SalaryAdvance {
+  id              String            @id @default(cuid())
+  employeeId      String
+  amount          Float
+  advanceDate     DateTime          @default(now())
+  dateString      String            // YYYY-MM-DD
+  monthString     String            // YYYY-MM (e.g. "2026-11")
+  notes           String?
+  status          String            @default("PAID") // PAID, RECOVERED, VOID
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  employee        Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([employeeId])
+  @@index([monthString])
+}
+
+model PayrollRecord {
+  id              String            @id @default(cuid())
+  employeeId      String
+  month           Int               // 1-12
+  year            Int               // e.g. 2026
+  monthKey        String            // "2026-11"
+  salaryType      SalaryType        @default(MONTHLY)
+  rate            Float             @default(0)
+  workingDays     Float             @default(0)
+  baseSalary      Float             @default(0)
+  serviceCharges  Float             @default(0)
+  bonus           Float             @default(0)
+  mealCost        Float             @default(0)
+  epfEtf          Float             @default(0)
+  advances        Float             @default(0)
+  totalSalary     Float             @default(0)
+  status          PayrollStatus     @default(OPEN)
+  paidAt          DateTime?
+  paymentMethod   String?           @default("BANK_TRANSFER")
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  employee        Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, monthKey])
+  @@index([monthKey])
+}
+
+
+
+
